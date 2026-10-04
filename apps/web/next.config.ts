@@ -3,6 +3,12 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const isStaticExport = process.env.STATIC_EXPORT === "true";
+// The build the desktop app carries: a self-contained server (scripts/build-desktop.mjs).
+const isDesktopBuild = process.env.DESKTOP_BUILD === "true";
+// The dev server behind `npm run desktop:dev`. It gets a build folder of its
+// own, so it can run beside an ordinary `npm run dev` without the two
+// overwriting each other's chunks.
+const isDesktopDev = process.env.LAYERLING_DESKTOP_DEV === "true";
 const extraAllowedDevOrigins = (process.env.LAYERLING_ALLOWED_DEV_ORIGINS ?? "")
   .split(",")
   .map((origin) => origin.trim())
@@ -21,10 +27,11 @@ const nextConfig: NextConfig = {
   // Keep the live development compiler isolated from `next build`. Sharing
   // `.next` lets a production verification build invalidate chunks used by a
   // running dev server, which also breaks API routes such as project snapshots.
-  distDir: isStaticExport ? ".next-export" : process.env.NODE_ENV === "development" ? ".next-dev" : ".next",
+  distDir: isStaticExport ? ".next-export" : isDesktopBuild ? ".next-desktop" : isDesktopDev ? ".next-desktop-dev" : process.env.NODE_ENV === "development" ? ".next-dev" : ".next",
   allowedDevOrigins: ["localhost", "127.0.0.1", ...extraAllowedDevOrigins],
   env: {
     NEXT_PUBLIC_STATIC_EXPORT: isStaticExport ? "true" : "false",
+    NEXT_PUBLIC_DESKTOP_BUILD: isDesktopBuild ? "true" : "false",
     NEXT_PUBLIC_OCCT_RUNTIME_VERSION: occtRuntimeVersion,
     NEXT_PUBLIC_APP_VERSION: appVersion,
   },
@@ -47,7 +54,9 @@ const nextConfig: NextConfig = {
         output: "export" as const,
         trailingSlash: true,
       }
-    : {}),
+    : isDesktopBuild
+      ? { output: "standalone" as const }
+      : {}),
 };
 
 export default nextConfig;

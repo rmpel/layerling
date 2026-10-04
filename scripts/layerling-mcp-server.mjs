@@ -3,8 +3,10 @@
 import { tools } from "./layerling-mcp-tools.mjs";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:3000";
+/** Where the desktop app listens (apps/desktop/main.cjs). Tried when nothing answers on the dev server's port. */
+const DESKTOP_BASE_URL = "http://127.0.0.1:47615";
 const MCP_ROUTE = "/api/layerling-mcp";
-const baseUrl = process.env.LAYERLING_URL || DEFAULT_BASE_URL;
+let baseUrl = process.env.LAYERLING_URL || DEFAULT_BASE_URL;
 
 function bridgeUrl() {
   return new URL(MCP_ROUTE, baseUrl);
@@ -21,9 +23,20 @@ async function bridgeFetch(options, timeoutMs) {
     if (error?.name === "TimeoutError") {
       throw new Error(`Layerling at ${baseUrl} did not answer within ${Math.round(timeoutMs / 1000)} s.`);
     }
+    // No dev server: the desktop app may be the one that is running. Once it
+    // has answered, later calls go straight there.
+    if (!process.env.LAYERLING_URL && baseUrl !== DESKTOP_BASE_URL) {
+      try {
+        const response = await fetch(new URL(MCP_ROUTE, DESKTOP_BASE_URL), { ...options, signal: AbortSignal.timeout(timeoutMs) });
+        baseUrl = DESKTOP_BASE_URL;
+        return response;
+      } catch {
+        // Neither is there; say so below.
+      }
+    }
     throw new Error(
-      `Cannot reach Layerling at ${baseUrl}. Start it with "npm run dev" and open an editor tab` +
-        ` (set LAYERLING_URL if it runs elsewhere).`,
+      `Cannot reach Layerling at ${baseUrl}. Start it with "npm run dev" and open an editor tab,` +
+        ` or open a design in the desktop app (set LAYERLING_URL if it runs elsewhere).`,
     );
   }
 }

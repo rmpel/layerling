@@ -20,6 +20,7 @@ import { duplicateName, type DuplicateNamePatterns } from "@/lib/duplicateName";
 import { migrateLegacyProjectShapes, migrateLegacyStorageKeys, PROJECT_SHAPES_DB_NAME } from "@/lib/storageMigration";
 import { useLanguage } from "@/lib/useLanguage";
 import { createLocalId } from "@/lib/localIds";
+import { desktopHost, documentNameFromPath, installDesktopStorageMirror, type DesktopCommand } from "@/lib/desktopHost";
 import {
   horizontalPlacementWorkplane,
   normalizePlacementWorkplane,
@@ -32,6 +33,10 @@ import { exportLylProject, importLylProject, LYL_CREATED_WITH_VERSION, LYL_MEDIA
 import { backupEntryNames, backupFileName, isBackupFileName, packBackup, unpackBackup, zipHoldsDesigns } from "@/lib/projectBackup";
 import { DEFAULT_SNAP_GRID, DEFAULT_WORKPLANE_WORKSPACE, normalizeSnapGrid, normalizeWorkspaceSettings, readWorkspaceDefault, workplaneSettingsFingerprint } from "@/lib/workplaneSettings";
 import type { GridSize, ProjectAsset, WorkplaneShape, WorkplaneWorkspaceSettings } from "@/types/layerling";
+
+// In the desktop app preferences belong in its settings file; this has to be
+// in place before the first of them is written.
+if (typeof window !== "undefined") installDesktopStorageMirror();
 
 type AppView = "dashboard" | "editor";
 type ViewMode = "grid" | "list";
@@ -53,7 +58,16 @@ type DashboardProject = {
   placementWorkplane?: PlacementWorkplane;
   sketchPlacementWorkplane?: PlacementWorkplane;
   sharedProject?: { fileName: string; revision: string; path?: string };
+  /** Desktop app: the .lyl file this design is saved in. Without one it has never been saved. */
+  documentFile?: { path: string };
+  /** Desktop app: changed since it was last written to its file; the changes are kept as a draft. */
+  documentDirty?: boolean;
 };
+
+/** Desktop app: whether a design holds work its file does not. */
+function projectHasUnsavedChanges(project: Pick<DashboardProject, "documentFile" | "documentDirty">) {
+  return !project.documentFile || Boolean(project.documentDirty);
+}
 
 type SharedProject = {
   fileName: string;
@@ -315,7 +329,50 @@ function projectResourceRecordId(projectId: string, kind: ProjectShapeResourceRe
   return `${projectId}:${projectResourceKey(kind, resourceId)}`;
 }
 
+/**
+ * Desktop app: the window's storage starts empty with every launch, and a
+ * design's bytes are on disk - as a draft of unsaved changes, or in its file.
+ * This fetches them the first time a design is needed. Without it a design
+ * that merely has not been read yet would look like an empty one.
+ */
+const desktopProjectSources = new Map<string, "draft" | "document">();
+
+async function ensureDesktopProjectRecord(projectId: string) {
+  const host = desktopHost();
+  if (!host) return;
+  const database = await openProjectShapesDb();
+  const present = await new Promise<boolean>((resolve, reject) => {
+    const request = database.transaction(PROJECT_SHAPES_STORE_NAME, "readonly").objectStore(PROJECT_SHAPES_STORE_NAME).getKey(projectId);
+    request.onerror = () => reject(request.error ?? new Error("Could not load project shapes"));
+    request.onsuccess = () => resolve(request.result !== undefined);
+  });
+  if (present) {
+    database.close();
+    return;
+  }
+  const source = await host.readProjectSource(projectId);
+  if (!source) {
+    database.close();
+    throw new Error(t("desktop.fileMissing"));
+  }
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(PROJECT_SHAPES_STORE_NAME, "readwrite");
+    transaction.objectStore(PROJECT_SHAPES_STORE_NAME).put({
+      id: projectId,
+      revision: 1,
+      lylPackage: new Uint8Array(source.bytes),
+      updatedAt: Date.now(),
+    } satisfies ProjectShapeRecord);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error("Could not load project shapes"));
+    transaction.onabort = () => reject(transaction.error ?? new Error("Could not load project shapes"));
+  });
+  database.close();
+  desktopProjectSources.set(projectId, source.source);
+}
+
 async function loadProjectShapes(projectId: string) {
+  await ensureDesktopProjectRecord(projectId);
   const database = await openProjectShapesDb();
   const record = await new Promise<ProjectShapeRecord | null>((resolve, reject) => {
     const transaction = database.transaction(PROJECT_SHAPES_STORE_NAME, "readonly");
@@ -460,6 +517,7 @@ async function projectThumbnailDataUrl(thumbnailUrl: string | null | undefined):
  * exported again just to hand the project to the server.
  */
 async function loadProjectPackage(projectId: string): Promise<Uint8Array | null> {
+  await ensureDesktopProjectRecord(projectId);
   const database = await openProjectShapesDb();
   const record = await new Promise<ProjectShapeRecord | null>((resolve, reject) => {
     const transaction = database.transaction(PROJECT_SHAPES_STORE_NAME, "readonly");
@@ -473,7 +531,12 @@ async function loadProjectPackage(projectId: string): Promise<Uint8Array | null>
   return stored ? new Uint8Array(stored) : null;
 }
 
-async function saveProjectShapes(projectId: string, entry: ProjectShapeCacheEntry, context: ProjectShapeSaveContext) {
+/**
+ * Writes a design's current state to the window's storage. In the desktop app
+ * it is also written to disk as a draft, so unsaved work survives the app
+ * closing - unless `clean` says this state is exactly what its file holds.
+ */
+async function saveProjectShapes(projectId: string, entry: ProjectShapeCacheEntry, context: ProjectShapeSaveContext, options: { clean?: boolean } = {}) {
   const lylPackage = await exportLylProject({
     projectId,
     projectName: context.projectName,
@@ -492,7 +555,8 @@ async function saveProjectShapes(projectId: string, entry: ProjectShapeCacheEntr
     compressionLevel: 1,
   });
   const database = await openProjectShapesDb();
-  return new Promise<void>((resolve, reject) => {
+  let written = false;
+  await new Promise<void>((resolve, reject) => {
     const transaction = database.transaction(PROJECT_SHAPES_STORE_NAME, "readwrite");
     const store = transaction.objectStore(PROJECT_SHAPES_STORE_NAME);
     const existingRequest = store.get(projectId);
@@ -504,6 +568,7 @@ async function saveProjectShapes(projectId: string, entry: ProjectShapeCacheEntr
       if (existing && existing.revision > entry.revision) {
         return;
       }
+      written = true;
       store.put({
         id: projectId,
         revision: entry.revision,
@@ -524,6 +589,8 @@ async function saveProjectShapes(projectId: string, entry: ProjectShapeCacheEntr
       reject(transaction.error ?? new Error("Could not save project shapes"));
     };
   });
+  const host = desktopHost();
+  if (host && written && !options.clean) await host.writeDraft(projectId, lylPackage);
 }
 
 function saveProjectShapesWhenIdle(projectId: string, entry: ProjectShapeCacheEntry, context: ProjectShapeSaveContext) {
@@ -545,6 +612,8 @@ function saveProjectShapesWhenIdle(projectId: string, entry: ProjectShapeCacheEn
 }
 
 async function deleteProjectShapes(projectId: string) {
+  desktopProjectSources.delete(projectId);
+  await desktopHost()?.deleteDraft(projectId);
   const database = await openProjectShapesDb();
   return new Promise<void>((resolve, reject) => {
     const transaction = database.transaction(PROJECT_SHAPES_STORE_NAME, "readwrite");
@@ -597,6 +666,10 @@ function readStoredProjects() {
               path: typeof project.sharedProject.path === "string" ? project.sharedProject.path : "",
             }
             : undefined,
+          documentFile: typeof project.documentFile?.path === "string" && project.documentFile.path
+            ? { path: project.documentFile.path }
+            : undefined,
+          documentDirty: project.documentDirty === true ? true : undefined,
         };
       });
     return { projects, legacyShapes };
@@ -651,6 +724,8 @@ function projectForStorage(project: DashboardProject): DashboardProject {
     placementWorkplane: normalizePlacementWorkplane(project.placementWorkplane, project.placementElevation),
     sketchPlacementWorkplane: normalizePlacementWorkplane(project.sketchPlacementWorkplane),
     sharedProject: project.sharedProject,
+    documentFile: project.documentFile,
+    documentDirty: project.documentDirty,
   };
 }
 
@@ -716,6 +791,22 @@ export default function Home() {
   const projectShapeSaveQueuesRef = useRef<Record<string, Promise<void>>>({});
   const [projectSaveFailure, setProjectSaveFailure] = useState<{ message: string; at: number } | null>(null);
   const editorLoadingStartedAtRef = useRef(0);
+  const openDesktopProjectRef = useRef<(projectId: string) => Promise<void>>(async () => undefined);
+  // The desktop app's menu calls in from outside React; it needs the state of now, not of when it subscribed.
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const projectShapesByIdRef = useRef(projectShapesById);
+  projectShapesByIdRef.current = projectShapesById;
+  const activeProjectIdRef = useRef(activeProjectId);
+  activeProjectIdRef.current = activeProjectId;
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const documentSaveRunningRef = useRef(false);
+  const desktopActionsRef = useRef<{ command: (command: DesktopCommand) => void; openPath: (path: string) => void }>({
+    command: () => undefined,
+    openPath: () => undefined,
+  });
+  const [hostNotice, setHostNotice] = useState<{ message: string; at: number; error?: boolean } | null>(null);
 
   // Warm the editor chunk once the dashboard is idle, so opening a project
   // does not wait for the download the first page load skipped.
@@ -877,6 +968,44 @@ export default function Home() {
     if (!mounted) return;
     void refreshSharedProjects();
   }, [mounted, refreshSharedProjects]);
+
+  // Desktop app: the File menu, files opened from outside, and closing the window.
+  useEffect(() => {
+    const host = desktopHost();
+    if (!host || !mounted) return;
+    const stopCommands = host.onCommand((command) => desktopActionsRef.current.command(command));
+    const stopOpening = host.onOpenPath((path) => desktopActionsRef.current.openPath(path));
+    const stopClosing = host.onBeforeClose(() => {
+      void (async () => {
+        // Let the editor hand over its last change, then wait until every draft is on disk.
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+        while (Object.keys(projectShapeSaveQueuesRef.current).length > 0) {
+          await Promise.allSettled(Object.values(projectShapeSaveQueuesRef.current));
+        }
+        host.confirmClose();
+      })();
+    });
+    host.ready();
+    return () => {
+      stopCommands();
+      stopOpening();
+      stopClosing();
+    };
+  }, [mounted]);
+
+  // Desktop app: the window title names the open design and says when it has unsaved changes.
+  useEffect(() => {
+    const host = desktopHost();
+    if (!host || !mounted) return;
+    const active = view === "editor" && activeProjectId ? projects.find((project) => project.id === activeProjectId) : undefined;
+    host.setDocumentState(active
+      ? {
+          title: active.name,
+          path: active.documentFile?.path ?? "",
+          edited: Boolean(active.documentDirty) || (!active.documentFile && active.shapes > 0),
+        }
+      : { title: "", path: "", edited: false });
+  }, [activeProjectId, mounted, projects, view]);
 
   useEffect(() => {
     if (!mounted) return;
@@ -1143,7 +1272,7 @@ export default function Home() {
         setProjects((current) =>
           current.map((project) =>
             project.id === snapshot.projectId && (project.revision ?? 0) <= revision
-              ? { ...project, shapes: snapshot.shapes.length, updatedAt: revision, revision }
+              ? { ...project, shapes: snapshot.shapes.length, updatedAt: revision, revision, ...(desktopHost() ? { documentDirty: true } : {}) }
               : project,
           ),
         );
@@ -1180,6 +1309,35 @@ export default function Home() {
     const placementWorkplane = normalizePlacementWorkplane(snapshot.placementWorkplane, placementElevation);
     const sketchPlacementWorkplane = normalizePlacementWorkplane(snapshot.sketchPlacementWorkplane);
     const nextFingerprint = `${workplaneSettingsFingerprint(workspace, snapGrid)}:${placementElevation}:${placementWorkplaneFingerprint(placementWorkplane)}:${placementWorkplaneFingerprint(sketchPlacementWorkplane)}`;
+    // Desktop app: the plate's settings travel in the file too, so a change to
+    // them alone is unsaved work and belongs in the draft.
+    const host = desktopHost();
+    const before = host ? projectsRef.current.find((project) => project.id === snapshot.projectId) : undefined;
+    const entry = projectShapesByIdRef.current[snapshot.projectId];
+    if (before && entry) {
+      const beforeFingerprint = `${workplaneSettingsFingerprint(
+        normalizeWorkspaceSettings(before.workspace),
+        normalizeSnapGrid(before.snapGrid),
+      )}:${before.placementElevation ?? 0}:${placementWorkplaneFingerprint(normalizePlacementWorkplane(before.placementWorkplane, before.placementElevation))}:${placementWorkplaneFingerprint(normalizePlacementWorkplane(before.sketchPlacementWorkplane))}`;
+      if (beforeFingerprint !== nextFingerprint) {
+        const previousSave = projectShapeSaveQueuesRef.current[snapshot.projectId] ?? Promise.resolve();
+        const queuedSave = previousSave.catch(() => undefined).then(() => saveProjectShapes(snapshot.projectId, entry, {
+          projectName: before.name,
+          createdAt: before.createdAt,
+          workspace,
+          snapGrid,
+          placementElevation,
+          placementWorkplane,
+          sketchPlacementWorkplane,
+        }));
+        projectShapeSaveQueuesRef.current[snapshot.projectId] = queuedSave;
+        void queuedSave.catch(() => undefined).finally(() => {
+          if (projectShapeSaveQueuesRef.current[snapshot.projectId] === queuedSave) {
+            delete projectShapeSaveQueuesRef.current[snapshot.projectId];
+          }
+        });
+      }
+    }
     setProjects((current) => {
       let changed = false;
       const next = current.map((project) => {
@@ -1201,6 +1359,7 @@ export default function Home() {
           placementWorkplane,
           sketchPlacementWorkplane,
           updatedAt: version,
+          ...(host ? { documentDirty: true } : {}),
         };
       });
       if (!changed) return current;
@@ -1233,7 +1392,18 @@ export default function Home() {
     openEditor(project.id, { allowMissingFromStorage: true });
   };
 
-  const openLylProjectFromFile = useCallback(async (file: File, sharedProject?: SharedProject) => {
+  const openLylProjectFromFile = useCallback(async (file: File, sharedProject?: SharedProject, documentOptions: { path?: string; replace?: boolean } = {}) => {
+    // Desktop app: a design opened from disk stays bound to that file, and a
+    // file that is open already is shown rather than opened a second time.
+    const host = desktopHost();
+    const documentPath = host && !sharedProject ? documentOptions.path ?? host.pathForFile(file) : null;
+    const existingDocument = documentPath
+      ? projectsRef.current.find((project) => project.documentFile?.path === documentPath)
+      : undefined;
+    if (existingDocument && !documentOptions.replace) {
+      await openDesktopProjectRef.current(existingDocument.id);
+      return { ok: true, message: t("desktop.opened", { name: existingDocument.name }) };
+    }
     setDashboardNotice(t("notice.validatingFile", { name: file.name }));
     try {
       const restored = await importLylProject(await file.arrayBuffer());
@@ -1248,7 +1418,7 @@ export default function Home() {
         // Der Dateiname sticht den Namen im Paket: Auf der Karte steht der
         // Dateiname, und eine Kopie traegt den des Originals im Paket, bis der
         // erste Speicherlauf ihn nachzieht.
-        ...(existing ?? newProject(sharedProject?.name ?? restored.projectName, projects.length, restored.shapes.length)),
+        ...(existing ?? existingDocument ?? newProject(sharedProject?.name ?? restored.projectName, projects.length, restored.shapes.length)),
         createdAt: restored.createdAt,
         updatedAt: now,
         revision: now,
@@ -1259,20 +1429,24 @@ export default function Home() {
         placementWorkplane: restored.placementWorkplane,
         sketchPlacementWorkplane: restored.sketchPlacementWorkplane,
         sharedProject: sharedProject ? { fileName: sharedProject.fileName, revision: sharedProject.revision, path: sharedProject.path ?? "" } : undefined,
+        ...(documentPath ? { name: documentNameFromPath(documentPath), documentFile: { path: documentPath }, documentDirty: false } : {}),
       };
       const entry = projectShapeCacheEntry(now, restored.shapes, restored.history, restored.historyIndex, restored.assets);
-      await saveProjectShapes(project.id, entry, projectShapeSaveContext(project));
+      // Going back to the file drops what was there before, draft included.
+      if (existingDocument) await deleteProjectShapes(project.id);
+      await saveProjectShapes(project.id, entry, projectShapeSaveContext(project), { clean: Boolean(documentPath) });
       setProjectShapesById((current) => ({ ...current, [project.id]: entry }));
-      setProjects((current) => existing
+      setProjects((current) => existing ?? existingDocument
         ? current.map((entryProject) => (entryProject.id === project.id ? project : entryProject))
         : [project, ...current]);
-      setDashboardNotice(sharedProject
+      const openedMessage = sharedProject
         ? t("notice.openedServerProject", { name: sharedProject.name })
-        : t("notice.openedLocalProject", { name: file.name }));
+        : documentPath
+          ? t("desktop.opened", { name: project.name })
+          : t("notice.openedLocalProject", { name: file.name });
+      setDashboardNotice(openedMessage);
       openEditor(project.id, { allowMissingFromStorage: true });
-      return { ok: true, message: sharedProject
-        ? t("notice.openedServerProject", { name: sharedProject.name })
-        : t("notice.openedLocalProject", { name: file.name }) };
+      return { ok: true, message: openedMessage };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not open layerling project";
       setDashboardNotice(message);
@@ -1753,7 +1927,7 @@ export default function Home() {
   const openLatestProject = () => {
     const latest = [...projects].sort((a, b) => b.updatedAt - a.updatedAt)[0];
     if (latest) {
-      openEditor(latest.id);
+      void openDesktopProject(latest.id);
       return;
     }
     createAndOpenProject();
@@ -1808,7 +1982,8 @@ export default function Home() {
       const stored = projectShapesById[projectId] ?? await loadProjectShapes(projectId);
       if (!stored) throw new Error(t("notice.projectShapesLoadFailed"));
       const now = Date.now();
-      const { sharedProject: _bound, ...carried } = source;
+      // The copy is a design of its own: neither the server file nor the file on disk is its.
+      const { sharedProject: _bound, documentFile: _file, documentDirty: _dirty, ...carried } = source;
       const copy: DashboardProject = {
         ...carried,
         id: createLocalId("project"),
@@ -1841,6 +2016,142 @@ export default function Home() {
     setProjects((current) =>
       current.map((project) => (project.id === projectId ? { ...project, name: nextName, updatedAt: Date.now() } : project)),
     );
+  };
+
+  /**
+   * Desktop app: opens a design from the start page. Its bytes may still be on
+   * disk only; they are fetched first, so a file that has gone missing is
+   * reported here instead of showing up as an empty design.
+   */
+  const openDesktopProject = async (projectId: string) => {
+    if (!desktopHost() || projectShapesByIdRef.current[projectId]) {
+      openEditor(projectId);
+      return;
+    }
+    try {
+      await ensureDesktopProjectRecord(projectId);
+    } catch (error) {
+      setDashboardNotice(error instanceof Error ? error.message : t("desktop.fileMissing"));
+      return;
+    }
+    if (desktopProjectSources.get(projectId) === "document") {
+      // Marked as changed, but the draft is gone: what is on screen is the file.
+      setProjects((current) => current.map((project) => (project.id === projectId && project.documentDirty ? { ...project, documentDirty: false } : project)));
+    }
+    openEditor(projectId);
+  };
+  openDesktopProjectRef.current = openDesktopProject;
+
+  /** Desktop app: a .lyl file chosen in the Open dialog, in Finder or under Open Recent. */
+  const openDocumentPath = async (path: string) => {
+    const host = desktopHost();
+    if (!host) return;
+    const existing = projectsRef.current.find((project) => project.documentFile?.path === path);
+    if (existing) {
+      await openDesktopProject(existing.id);
+      return;
+    }
+    try {
+      const bytes = await host.readDocument(path);
+      const fileName = path.split(/[\\/]/).pop() ?? "design.lyl";
+      await openLylProjectFromFile(new File([new Uint8Array(bytes)], fileName, { type: LYL_MEDIA_TYPE }), undefined, { path });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t("desktop.fileMissing");
+      setDashboardNotice(message);
+      setHostNotice({ message, at: Date.now(), error: true });
+    }
+  };
+
+  /** Desktop app: writes the open design to its .lyl file, asking where when it has none yet. */
+  const saveActiveDocument = async (saveAs: boolean) => {
+    const host = desktopHost();
+    const projectId = activeProjectIdRef.current;
+    if (!host || viewRef.current !== "editor" || !projectId || documentSaveRunningRef.current) return;
+    documentSaveRunningRef.current = true;
+    try {
+      // The editor hands a change over a moment after it happened; give the last one time to arrive.
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
+      await (projectShapeSaveQueuesRef.current[projectId] ?? Promise.resolve()).catch(() => undefined);
+      const project = projectsRef.current.find((candidate) => candidate.id === projectId);
+      const entry = projectShapesByIdRef.current[projectId];
+      if (!project || !entry) return;
+      const context = projectShapeSaveContext(project);
+      const bytes = await exportLylProject({
+        projectId,
+        projectName: context.projectName,
+        createdAt: context.createdAt,
+        modifiedAt: Date.now(),
+        shapes: entry.shapes,
+        notes: notesForHistoryIndex(entry.history, entry.historyIndex),
+        history: entry.history,
+        historyIndex: entry.historyIndex,
+        assets: entry.assets,
+        workspace: context.workspace,
+        snapGrid: context.snapGrid,
+        placementElevation: context.placementElevation,
+        placementWorkplane: context.placementWorkplane,
+        sketchPlacementWorkplane: context.sketchPlacementWorkplane,
+      });
+      const saved = await host.saveDocument({
+        path: saveAs ? null : project.documentFile?.path ?? null,
+        suggestedName: project.name,
+        bytes,
+      });
+      if (!saved) return;
+      // A change made while the file was being written is not in it.
+      const unchangedSince = projectShapesByIdRef.current[projectId]?.revision === entry.revision;
+      // Saving over the file of another design in the list leaves that one without a file of its own.
+      const overwritten = projectsRef.current.filter((candidate) => candidate.id !== projectId && candidate.documentFile?.path === saved.path);
+      setProjects((current) => current
+        .filter((candidate) => !overwritten.some((gone) => gone.id === candidate.id))
+        .map((candidate) => (candidate.id === projectId
+          ? { ...candidate, name: saved.name, documentFile: { path: saved.path }, documentDirty: !unchangedSince }
+          : candidate)));
+      for (const gone of overwritten) void deleteProjectShapes(gone.id).catch(() => undefined);
+      if (unchangedSince) await host.deleteDraft(projectId);
+      setHostNotice({ message: t("desktop.saved", { name: saved.name }), at: Date.now() });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "";
+      setHostNotice({ message: detail ? `${t("desktop.saveFailed")}: ${detail}` : t("desktop.saveFailed"), at: Date.now(), error: true });
+    } finally {
+      documentSaveRunningRef.current = false;
+    }
+  };
+
+  /** Desktop app: throws the unsaved changes away and shows the design as its file has it. */
+  const revertActiveDocument = async () => {
+    const host = desktopHost();
+    const project = projectsRef.current.find((candidate) => candidate.id === activeProjectIdRef.current);
+    if (!host || viewRef.current !== "editor" || !project) return;
+    const path = project.documentFile?.path;
+    if (!path) {
+      setHostNotice({ message: t("desktop.nothingToRevert", { name: project.name }), at: Date.now() });
+      return;
+    }
+    if (!project.documentDirty) return;
+    if (!window.confirm(t("desktop.revertConfirm", { name: project.name }))) return;
+    try {
+      await (projectShapeSaveQueuesRef.current[project.id] ?? Promise.resolve()).catch(() => undefined);
+      const bytes = await host.readDocument(path);
+      const fileName = path.split(/[\\/]/).pop() ?? "design.lyl";
+      const result = await openLylProjectFromFile(new File([new Uint8Array(bytes)], fileName, { type: LYL_MEDIA_TYPE }), undefined, { path, replace: true });
+      setHostNotice(result.ok
+        ? { message: t("desktop.reverted", { name: project.name }), at: Date.now() }
+        : { message: result.message, at: Date.now(), error: true });
+    } catch (error) {
+      setHostNotice({ message: error instanceof Error ? error.message : t("desktop.fileMissing"), at: Date.now(), error: true });
+    }
+  };
+
+  desktopActionsRef.current = {
+    command: (command) => {
+      if (command === "new") createAndOpenProject();
+      else if (command === "save") void saveActiveDocument(false);
+      else if (command === "save-as") void saveActiveDocument(true);
+      else if (command === "revert") void revertActiveDocument();
+      else if (command === "home" && viewRef.current === "editor") openDashboard();
+    },
+    openPath: (path) => void openDocumentPath(path),
   };
 
   if (!mounted) {
@@ -1910,7 +2221,7 @@ export default function Home() {
           onImportFile={() => dashboardImportInputRef.current?.click()}
           onBackupAll={() => void backupAllProjects()}
           onOpenSharedProject={(project) => void openSharedProject(project)}
-          onOpenProject={openEditor}
+          onOpenProject={(projectId) => void openDesktopProject(projectId)}
           onQueryChange={setQuery}
           onRenameProject={renameProject}
           onRefreshSharedProjects={() => void refreshSharedProjects()}
@@ -1942,6 +2253,7 @@ export default function Home() {
             onProjectShapesChange={updateProjectShapes}
             onProjectSnapshot={updateProjectSnapshot}
             projectSaveFailure={projectSaveFailure}
+            hostNotice={hostNotice}
             onProjectWorkspaceChange={updateProjectWorkspace}
             onProjectNameChange={(name) => {
               if (activeProjectId) renameProject(activeProjectId, name);
@@ -2614,14 +2926,16 @@ function Dashboard({
                   {dashboardNotice}
                 </div>
               ) : null}
-              <InstallAppHint />
+              {desktopHost() ? null : <InstallAppHint />}
 
               <div className="dashboard-section-header">
                 <div>
                   <h1>{t("dashboard.projects")}</h1>
-                  <span className="dashboard-section-subtitle">{projects.length === 1
-                    ? t("dashboard.projectsVisibleOne")
-                    : t("dashboard.projectsVisibleMany", { count: projects.length })}</span>
+                  <span className="dashboard-section-subtitle">{desktopHost()
+                    ? t("desktop.recentDesigns")
+                    : projects.length === 1
+                      ? t("dashboard.projectsVisibleOne")
+                      : t("dashboard.projectsVisibleMany", { count: projects.length })}</span>
                 </div>
                 <div className="dashboard-controls">
                   {projects.length > 0 ? (
@@ -2709,6 +3023,7 @@ function Dashboard({
                         <span className="project-card-title">{project.name}</span>
                         <span className="project-card-meta">
                           {formatUpdated(project.updatedAt, language)} - {t("dashboard.shapeCount", { count: project.shapes })}
+                          {desktopHost() && projectHasUnsavedChanges(project) ? ` - ${t(project.documentFile ? "desktop.edited" : "desktop.unsaved")}` : ""}
                         </span>
                       </button>
                       <button
@@ -2794,7 +3109,9 @@ function Dashboard({
                 <X size={18} />
               </button>
             </header>
-            <p>{t("confirm.deleteProjectBody", { name: projectPendingDelete.name })}</p>
+            <p>{desktopHost() && projectPendingDelete.documentFile
+              ? t("desktop.removeDocumentBody", { name: projectPendingDelete.name })
+              : t("confirm.deleteProjectBody", { name: projectPendingDelete.name })}</p>
             <div className="dashboard-confirm-actions">
               <button className="dashboard-confirm-cancel" type="button" onClick={() => setProjectPendingDeleteId(null)}>
                 {t("confirm.cancel")}

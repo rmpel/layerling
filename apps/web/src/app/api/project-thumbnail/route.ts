@@ -4,7 +4,10 @@ import { NextResponse } from "next/server";
 
 export const revalidate = false;
 
-const THUMBNAIL_DIR = path.join(process.cwd(), ".codex", "project-thumbnails");
+// The desktop app names a folder beside its settings; its own program folder is not for writing.
+const THUMBNAIL_DIR = process.env.LAYERLING_THUMBNAIL_DIR?.trim()
+  ? path.resolve(process.env.LAYERLING_THUMBNAIL_DIR.trim())
+  : path.join(process.cwd(), ".codex", "project-thumbnails");
 const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
 const MAX_THUMBNAIL_BYTES = 5 * 1024 * 1024;
 const MAX_THUMBNAIL_REQUEST_BYTES = Math.ceil((MAX_THUMBNAIL_BYTES * 4) / 3) + PNG_DATA_URL_PREFIX.length + 2048;

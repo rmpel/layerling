@@ -7,6 +7,8 @@ node_modules/
 .next/
 .next-dev/
 .next-export/
+.next-desktop/
+.next-desktop-dev/
 out/
 build/
 dist/
@@ -21,6 +23,10 @@ apps/web/public/kontakt.php
 # The user guide is built from docs/guide by scripts/build-guide.mjs.
 apps/web/public/anleitung/
 apps/web/public/guide/
+
+# Desktop app: the staged server and the built installers
+apps/desktop/.build/
+dist-desktop/
 
 # Environment files
 .env

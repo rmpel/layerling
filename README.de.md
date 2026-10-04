@@ -222,6 +222,37 @@ der Werkstatt ist genau das der Zweck; auf einer öffentlich erreichbaren Seite 
 Beim Ausliefern daran denken: Wer den Export mit einer Option spiegelt, die Überzähliges löscht – `rsync --delete`,
 `robocopy /MIR`, WinSCP `-delete` –, muss `store` ausdrücklich ausnehmen. Sonst räumt jedes Update die Projekte weg.
 
+### Desktop-App
+
+layerling läuft auch als Desktop-App – für alle, die ihre Entwürfe lieber als Dateien haben als im Speicher des
+Browsers. Es ist derselbe Editor in einem eigenen Fenster, mit einem Datei-Menü:
+
+- **Entwürfe sind `.lyl`-Dateien**, wo immer du sie ablegst. *Save* (Cmd/Strg+S) schreibt die Datei, *Save As…* eine
+  neue, *Open…* und ein Doppelklick im Dateimanager öffnen eine. Die Startseite zeigt, was zuletzt geöffnet war.
+- **Ungespeichertes geht nicht verloren.** Jede Änderung bleibt als Zwischenstand erhalten, bis du speicherst; nach
+  dem Beenden oder einem Absturz ist der Entwurf wieder da, als geändert markiert. *Revert to Saved* verwirft den
+  Zwischenstand.
+- **Nichts liegt im Browserspeicher.** Einstellungen stehen in `settings.json`, die Liste der Entwürfe in
+  `documents.json`, Zwischenstände in `drafts/` – alles im Datenordner der App (`~/Library/Application Support/Layerling`
+  auf dem Mac, `%APPDATA%\Layerling` unter Windows, `~/.config/Layerling` unter Linux).
+- **Die MCP-Brücke funktioniert** mit der App wie mit `npm run dev`; der MCP-Server findet sie von selbst auf Port 47615.
+
+Gebaut wird sie für ein Ziel (Node.js wie unter [Was du brauchst](#was-du-brauchst)):
+
+```bash
+npm install
+npm run desktop:build -- mac-arm64
+```
+
+Ziele sind `mac-arm64`, `mac-x64`, `linux-x64`, `linux-arm64`, `win-x64` und `win-arm64`; ohne Angabe der Rechner, auf
+dem gebaut wird. Das Ergebnis liegt in `dist-desktop/`. Mit `--dir` entsteht nur die entpackte App ohne Installer.
+Bisher ist nur `mac-arm64` gebaut und ausprobiert; der Mac-Build ist für den Rechner signiert, der ihn gebaut hat, nicht
+notarisiert, und die App aktualisiert sich nicht selbst. `npm run desktop:dev` startet die App gegen den
+Entwicklungsserver, mit Hot Reload.
+
+Entwürfe aus dem Browser kommen herüber, indem du sie dort als `.lyl` speicherst (oder *Alle sichern* nutzt) und in der
+App öffnest.
+
 ## An layerling arbeiten
 
 Diesen Weg nimmst du, wenn du den Quelltext ändern willst.

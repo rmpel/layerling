@@ -1424,6 +1424,17 @@ export const MESSAGES_EN = {
   "notice.importedDesignName": "Imported design ({count} files)",
   "notice.importing": "Importing {index} of {total}: {name}",
   "notice.importProjectFailed": "Could not create a design for the imported files",
+  "desktop.recentDesigns": "recently opened, and designs not saved to a file yet",
+  "desktop.unsaved": "not saved yet",
+  "desktop.edited": "unsaved changes",
+  "desktop.opened": "Opened {name}",
+  "desktop.saved": "Saved {name}",
+  "desktop.saveFailed": "Could not save the design",
+  "desktop.fileMissing": "The file of this design is no longer where it was",
+  "desktop.nothingToRevert": "{name} has not been saved to a file yet",
+  "desktop.revertConfirm": "Discard the unsaved changes to {name} and go back to the saved file?",
+  "desktop.reverted": "{name} is back to its saved version",
+  "desktop.removeDocumentBody": "Remove the design {name} from this list? Its file stays where it is; unsaved changes are discarded.",
 } as const;
 
 export type MessageKey = keyof typeof MESSAGES_EN;

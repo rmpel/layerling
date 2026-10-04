@@ -292,6 +292,8 @@ type BooleanAutomationResult = {
 const SHARED_CLIPBOARD_STORAGE_KEY = "layerling.clipboard";
 const SYSTEM_CLIPBOARD_PREFIX = "LAYERLING/1\n";
 const STATIC_EXPORT_BUILD = process.env.NEXT_PUBLIC_STATIC_EXPORT === "true";
+/** The build inside the desktop app: a production build, but on the user's own machine, so the MCP bridge stays on. */
+const DESKTOP_BUILD = process.env.NEXT_PUBLIC_DESKTOP_BUILD === "true";
 
 declare global {
   interface Window {
@@ -6244,6 +6246,7 @@ export function LayerlingEditor({
   onProjectShapesChange,
   onProjectSnapshot,
   projectSaveFailure,
+  hostNotice,
   onProjectWorkspaceChange,
   onProjectNameChange,
   projectId,
@@ -6287,6 +6290,8 @@ export function LayerlingEditor({
   onProjectSnapshot?: (snapshot: { image: string; projectId: string; shapes: number }, signal?: AbortSignal) => Promise<void> | void;
   /** The last failed autosave, so the editor can say so; `at` makes a repeat failure show again. */
   projectSaveFailure?: { message: string; at: number } | null;
+  /** Something the desktop app has to say while the editor is on screen, such as "Saved". */
+  hostNotice?: { message: string; at: number; error?: boolean } | null;
   onProjectNameChange?: (name: string) => void;
   onProjectWorkspaceChange?: (snapshot: {
     projectId: string;
@@ -6460,6 +6465,10 @@ export function LayerlingEditor({
   useEffect(() => {
     if (projectSaveFailure) setNotice(projectSaveFailure.message, true);
   }, [projectSaveFailure, setNotice]);
+
+  useEffect(() => {
+    if (hostNotice) setNotice(hostNotice.message, Boolean(hostNotice.error));
+  }, [hostNotice, setNotice]);
 
   // Die Statuszeile traegt fertigen Text, keinen Schluessel. Nach einem
   // Sprachwechsel waere die stehende Meldung ohnehin veraltet, also faellt
@@ -10775,7 +10784,7 @@ export function LayerlingEditor({
   }, [executeMcpCommand]);
 
   useEffect(() => {
-    if (process.env.NODE_ENV === "production" || typeof window === "undefined") {
+    if ((process.env.NODE_ENV === "production" && !DESKTOP_BUILD) || typeof window === "undefined") {
       return;
     }
     if (!["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) {
@@ -10881,7 +10890,7 @@ export function LayerlingEditor({
   }, []);
 
   useEffect(() => {
-    if (process.env.NODE_ENV === "production" || typeof window === "undefined") {
+    if ((process.env.NODE_ENV === "production" && !DESKTOP_BUILD) || typeof window === "undefined") {
       return;
     }
     if (!["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) {

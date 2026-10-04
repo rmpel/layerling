@@ -13,7 +13,8 @@ import { isLocalRequest } from "@/lib/layerlingMcpLocalRequest";
 export const revalidate = false;
 
 function localOnly(request: Request) {
-  if (process.env.NODE_ENV === "production") {
+  // The desktop app is a production build too, but it runs on the user's own machine.
+  if (process.env.NODE_ENV === "production" && process.env.NEXT_PUBLIC_DESKTOP_BUILD !== "true") {
     return NextResponse.json({ error: "layerling MCP is only available in local development." }, { status: 404 });
   }
   if (!isLocalRequest(request)) {

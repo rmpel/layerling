@@ -213,6 +213,34 @@ a workshop that is the point; on a publicly reachable site, protect it or leave 
 One thing to remember when deploying: if you mirror the export with an option that removes anything extra – `rsync
 --delete`, `robocopy /MIR`, WinSCP `-delete` – exclude `store` explicitly, or every update will wipe the projects.
 
+### Desktop App
+
+layerling also runs as a desktop app, for anyone who would rather have designs as files than in browser storage. It is
+the same editor in a window of its own, with a File menu:
+
+- **Designs are `.lyl` files** wherever you put them. *Save* (Cmd/Ctrl+S) writes the file, *Save As…* writes a new one,
+  *Open…* and a double-click in the file manager open one. The start page lists what you opened recently.
+- **Unsaved work is not lost.** Every change is kept as a draft until you save; quit or crash, and the design comes back
+  as you left it, marked as having unsaved changes. *Revert to Saved* throws the draft away.
+- **Nothing lives in browser storage.** Preferences are in `settings.json`, the list of designs in `documents.json`,
+  drafts in `drafts/` – all in the app's data folder (`~/Library/Application Support/Layerling` on a Mac,
+  `%APPDATA%\Layerling` on Windows, `~/.config/Layerling` on Linux).
+- **The MCP bridge works** with the app as it does with `npm run dev`; the MCP server finds it on port 47615 by itself.
+
+Build it for one target (Node.js as under [What You Need](#what-you-need)):
+
+```bash
+npm install
+npm run desktop:build -- mac-arm64
+```
+
+Targets are `mac-arm64`, `mac-x64`, `linux-x64`, `linux-arm64`, `win-x64` and `win-arm64`; without one, the machine you
+are on. The result lands in `dist-desktop/`. Add `--dir` for the unpacked app without an installer. So far only
+`mac-arm64` has been built and tried; the Mac build is signed for the machine that built it, not notarized, and the app
+does not update itself. `npm run desktop:dev` starts the app against the dev server, with hot reload.
+
+To move designs over from the browser, save them there as `.lyl` (or use *Back up all*) and open them in the app.
+
 ## Working on layerling
 
 Take this path if you want to change the code.
