@@ -25,6 +25,8 @@ export type DesktopHost = {
   /** Writes to `path`, or asks where when there is none. Null when the user cancelled. */
   saveDocument: (request: { path: string | null; suggestedName: string; bytes: Uint8Array }) => Promise<{ path: string; name: string } | null>;
   pathForFile: (file: File) => string | null;
+  /** Shows the Open dialog; what the user picks arrives through `onOpenPath`. */
+  showOpenDialog: () => void;
   setDocumentState: (state: { title: string; path: string; edited: boolean }) => void;
   onCommand: (callback: (command: DesktopCommand) => void) => () => void;
   onOpenPath: (callback: (path: string) => void) => () => void;

@@ -985,8 +985,28 @@ export default function Home() {
         host.confirmClose();
       })();
     });
+    // The File menu's keys, taken before the editor sees them: there a bare S
+    // makes a shape solid, and it does not ask which modifier came with it. A
+    // key the page has handled no longer reaches the menu, so nothing runs twice.
+    const fileMenuKeys = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      const command: DesktopCommand | "open" | null = key === "s"
+        ? event.shiftKey ? "save-as" : "save"
+        : event.shiftKey
+          ? key === "h" ? "home" : null
+          : key === "n" ? "new" : key === "o" ? "open" : null;
+      if (!command) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (event.repeat) return;
+      if (command === "open") host.showOpenDialog();
+      else desktopActionsRef.current.command(command);
+    };
+    window.addEventListener("keydown", fileMenuKeys, true);
     host.ready();
     return () => {
+      window.removeEventListener("keydown", fileMenuKeys, true);
       stopCommands();
       stopOpening();
       stopClosing();

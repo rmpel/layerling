@@ -412,6 +412,7 @@ function registerIpc() {
     if (closeTimer !== null) clearTimeout(closeTimer);
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
   });
+  ipcMain.on("document:open-dialog", () => void showOpenDialog());
   ipcMain.on("document:approve", (_event, filePath) => approvePath(filePath));
   ipcMain.on("window:document-state", (_event, state) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;

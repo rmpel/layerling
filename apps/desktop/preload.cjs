@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld("layerlingDesktop", {
     ipcRenderer.send("document:approve", filePath);
     return filePath;
   },
+  showOpenDialog: () => ipcRenderer.send("document:open-dialog"),
   setDocumentState: (state) => ipcRenderer.send("window:document-state", state),
   onCommand: (callback) => subscribe("desktop:command", callback),
   onOpenPath: (callback) => subscribe("desktop:open-path", callback),
