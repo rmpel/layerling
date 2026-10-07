@@ -3134,9 +3134,54 @@ html[data-theme="dark"]:where([data-palette="graphite"]) .inspector-bundle-note 
   fill: rgba(155, 80, 0, 0.28);
 }
 
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.vertex,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.note,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.midpoint,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.centre,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.point {
+  fill: rgba(225, 119, 9, 0.35);
+  stroke: #b66108;
+}
+
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.centre circle,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.centre line,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.grid line {
+  fill: none;
+  stroke: inherit;
+}
+
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-point.centre {
+  fill: none;
+}
+
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-snap-label {
+  color: #ffffff;
+  background: rgba(150, 78, 4, 0.92);
+  box-shadow: 0 1px 4px rgba(44, 44, 44, 0.2);
+}
+
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-snap-label.face,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-snap-label.grid,
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-snap-label.tapeLine {
+  color: #444444;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(207, 207, 207, 0.96);
+}
+
+html[data-theme="dark"]:where([data-palette="graphite"]) .tape-snap-label.face,
+html[data-theme="dark"]:where([data-palette="graphite"]) .tape-snap-label.grid,
+html[data-theme="dark"]:where([data-palette="graphite"]) .tape-snap-label.tapeLine {
+  color: #e1e1e1;
+  background: rgba(36, 36, 36, 0.94);
+  border-color: #4c4c4c;
+}
+
 :where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-edge {
   fill: none;
   stroke: #e17709;
+}
+
+:where(html[data-theme="dark"][data-palette="graphite"]) .tape-hover-edge.whole {
   filter: drop-shadow(0 0 3px rgba(173, 89, 0, 0.48));
 }
 

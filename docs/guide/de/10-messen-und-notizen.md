@@ -17,6 +17,10 @@ Das Maßband liegt am unteren Ende der Kameraleiste am linken Rand ({{ui:camera.
 
 Mit [[Esc]] verlässt du den Messmodus.
 
+### Einrasten an Ecken, Kanten und Flächen
+
+Beim Setzen oder Verschieben eines Punktes hält sich das Maßband an den Körper unter dem Zeiger und sagt, was es neben dem Zeiger gefunden hat: {{ui:tape.snap.vertex}} für eine Ecke, {{ui:tape.snap.midpoint}} für die Mitte einer Kante, {{ui:tape.snap.centre}} für den Mittelpunkt einer runden Kante wie einer Bohrung oder des Rands eines Zylinders, {{ui:tape.snap.note}} für eine Notiz oder einen Bezugspunkt, {{ui:tape.snap.edge}}, wenn es auf einer Kante landet, und {{ui:tape.snap.face}}, wenn es auf einer Fläche landet, die dann aufleuchtet. Auf einer Kante oder Fläche bleibt der Punkt, wo du hinzeigst; er wird genau auf diese Kante oder in diese Fläche gesetzt und rückt in Schritten des Fangrasters (unten rechts) weiter: auf einer Kante gezählt von ihrem Ende, mit dem Abstand zum näheren Ende in der Beschriftung, auf einer ebenen Fläche auf dem Raster in dieser Fläche. Ist das Fangraster aus, gleitet er frei über Kante oder Fläche. Ecken und Kanten auf der Rückseite eines Körpers bleiben außen vor, der Punkt springt also nie hinter das, was du siehst. Halte [[Umschalt]] beim Klick auf eine Kante, um die ganze Kante auf einmal zu messen. Halte [[Alt]] gedrückt, um einen Punkt frei zu setzen, ohne Einrasten. Sind Körper ausgewählt, rastet das Maßband nur an ihnen ein.
+
 ## Das Lineal
 
 Aus der Formenbibliothek holst du das {{ui:shape.ruler}}. Es ist ein reines Messwerkzeug: Es erscheint in keinem Export und lässt sich weder gruppieren noch verschneiden. Für jeden Körper, der das Lineal berührt oder überlappt, zeigt es die Ausdehnung als schwebende Zahl direkt in der Ansicht. Diese Zahl kannst du direkt dort ändern, und der Körper passt sich an. Über das schwebende Plus-Symbol legst du eine Kopie der gemessenen Form an.

@@ -7656,15 +7656,82 @@ html[data-theme="dark"] .inspector-bundle-note {
   pointer-events: none;
 }
 
+/* A snap to a corner, midpoint or centre is certain: drawn solid and filled. */
+.tape-hover-point.vertex,
+.tape-hover-point.note,
+.tape-hover-point.midpoint,
+.tape-hover-point.centre,
+.tape-hover-point.point {
+  fill: rgba(225, 119, 9, 0.35);
+  stroke: #b66108;
+  stroke-dasharray: none;
+}
+
+.tape-hover-point.centre circle,
+.tape-hover-point.centre line,
+.tape-hover-point.grid line {
+  fill: none;
+  stroke: inherit;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.tape-hover-point.centre {
+  fill: none;
+}
+
+.tape-hover-point.grid {
+  stroke-dasharray: none;
+}
+
+.tape-snap-label {
+  position: absolute;
+  z-index: 3;
+  padding: 3px 7px;
+  color: #ffffff;
+  background: rgba(150, 78, 4, 0.92);
+  border-radius: 4px;
+  box-shadow: 0 1px 4px rgba(58, 40, 20, 0.2);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.tape-snap-label.face,
+.tape-snap-label.grid,
+.tape-snap-label.tapeLine {
+  color: #5c4127;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(224, 208, 190, 0.96);
+}
+
+html[data-theme="dark"] .tape-snap-label.face,
+html[data-theme="dark"] .tape-snap-label.grid,
+html[data-theme="dark"] .tape-snap-label.tapeLine {
+  color: #ede4d4;
+  background: rgba(40, 30, 20, 0.94);
+  border-color: #5b4b3a;
+}
+
+/* The edge a point slides along: a thin trace. With Shift the click takes
+   the whole edge, and it is drawn in full strength. */
 .tape-hover-edge {
   fill: none;
   stroke: #e17709;
-  stroke-width: 4;
+  stroke-width: 2;
+  stroke-opacity: 0.8;
   stroke-linecap: round;
   stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
-  filter: drop-shadow(0 0 3px rgba(173, 89, 0, 0.48));
   pointer-events: none;
+}
+
+.tape-hover-edge.whole {
+  stroke-width: 4;
+  stroke-opacity: 1;
+  filter: drop-shadow(0 0 3px rgba(173, 89, 0, 0.48));
 }
 
 .tape-label {

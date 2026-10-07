@@ -26,7 +26,7 @@ import { ShapeInspector, SnapGridControl, type ShapeInspectorUpdateOptions } fro
 import { WorkspaceSettingsModal } from "@/components/workplane/WorkspaceSettingsModal";
 import { appThemePalette, type AppThemePalette, type AppThemePreference, type ResolvedAppTheme } from "@/lib/appTheme";
 import { cadModifierPrimitiveForBakedShape, cadTransformFromMatrix, cadTransformToMatrix } from "@/lib/cadBakeMetadata";
-import { t } from "@/lib/i18n";
+import { t, type MessageKey } from "@/lib/i18n";
 import type { ModelSplitPlane } from "@/lib/modelSplit";
 import { useLanguage } from "@/lib/useLanguage";
 import { orthographicFramingZoom, perspectiveFramingDistance } from "@/lib/cameraFraming";
@@ -130,6 +130,7 @@ import {
 import type { AlignAxis, AlignHandleStatus, AlignTarget, GridSize, MeasurementAccuracy, ShapeAsset, WorkplaneNote, WorkplaneNoteAnchor, WorkplaneShape, WorkplaneWorkspaceSettings } from "@/types/layerling";
 import { NOTE_TEXT_LIMIT, referencePoints } from "@/lib/workplaneNotes";
 import { planarFaceCentroid, planarFaceTriangles, type PivotPoint } from "@/lib/rotationPivot";
+import { analyzeSnapGeometry, circleCentre } from "@/lib/tapeSnap";
 import { outwardFaceNormal } from "@/lib/layFlat";
 import { OVERHANG_PLATE_TOLERANCE, overhangDownwardLimit } from "@/lib/overhangLimits";
 import { directionIsOwnShapeAxis, rotatedGeometryShapePatch } from "@/lib/geometryRotation";
@@ -478,6 +479,8 @@ type ThreeState = {
   layFlatHoverLayer?: THREE.Group;
   /** The bent-tube segment the settings are about, drawn over the tube. */
   bentTubeSegmentLayer?: THREE.Group;
+  /** The face a tape point would land on, lit while placing or moving one. */
+  tapeFaceLayer?: THREE.Group;
   shapeLayer: THREE.Group;
   helperLayer: THREE.Group;
   splitLayer: THREE.Group;
@@ -667,8 +670,11 @@ type TapeModel = {
 type TapeOverlayState = {
   points: Array<TapePoint & { screenX: number; screenY: number }>;
   segments: Array<TapeSegment & { x1: number; y1: number; x2: number; y2: number; screenPoints?: string; labelX: number; labelY: number; label: string }>;
-  hover: { screenX: number; screenY: number; edgeScreenPoints?: string } | null;
+  hover: { screenX: number; screenY: number; edgeScreenPoints?: string; wholeEdge?: boolean; kind?: TapeSnapKind; detail?: string } | null;
 };
+
+/** What the tape point under the pointer holds on to; drawn and named while placing. */
+type TapeSnapKind = "vertex" | "midpoint" | "centre" | "edge" | "wholeEdge" | "note" | "face" | "grid" | "point" | "tapeLine";
 
 type TapeCandidate = {
   x: number;
@@ -677,6 +683,13 @@ type TapeCandidate = {
   pointId?: string;
   attachment?: TapeAttachment;
   edge?: TapeEdgeAttachment;
+  snap?: TapeSnapKind;
+  /** Shift on an edge: the click measures the whole edge instead of placing a point on it. */
+  wholeEdge?: boolean;
+  /** On an edge: how far the point is from the nearer end, shown beside the snap label. */
+  alongEdge?: number;
+  /** The face under the pointer, lit up while placing: the mesh and one of its triangles. */
+  face?: { meshId: string; triangle: number };
 };
 
 type TapePointDragState = {
@@ -1560,6 +1573,20 @@ function tapeNormalizedLineSegments(state: ThreeState, shapeId: string) {
   };
   const segments: Array<[THREE.Vector3, THREE.Vector3]> = [];
   object.traverse((child) => {
+    // The tape snaps to the body's own edges whether or not lines are drawn,
+    // so a body keeps its tape points by those edges too.
+    if (child instanceof THREE.Mesh && child.visible) {
+      const analysis = analyzeSnapGeometry(child.geometry as THREE.BufferGeometry);
+      analysis?.paths.forEach((path) => {
+        for (let offset = 0; offset + 5 < path.points.length; offset += 3) {
+          segments.push([
+            normalizedFromWorld(new THREE.Vector3(path.points[offset], path.points[offset + 1], path.points[offset + 2]).applyMatrix4(child.matrixWorld)),
+            normalizedFromWorld(new THREE.Vector3(path.points[offset + 3], path.points[offset + 4], path.points[offset + 5]).applyMatrix4(child.matrixWorld)),
+          ]);
+        }
+      });
+      return;
+    }
     if (!(child instanceof THREE.Line) || !child.visible) return;
     const position = child.geometry.getAttribute("position");
     if (!position || position.count < 2) return;
@@ -1615,122 +1642,358 @@ function tapeEdgeMatchesTopology(state: ThreeState, edge: TapeEdgeAttachment) {
   });
 }
 
-function pickModelTapeCandidate(state: ThreeState, shapeIds: string[], clientX: number, clientY: number): TapeCandidate | null {
+/** Snap radii around the pointer, in screen pixels. Points beat edges, edges beat faces. */
+const TAPE_VERTEX_SNAP_PX = 13;
+const TAPE_POINT_SNAP_PX = 11;
+const TAPE_EDGE_SNAP_PX = 10;
+
+type TapeWorldPath = {
+  key: string;
+  shapeId: string;
+  topologyKey?: string;
+  points: THREE.Vector3[];
+  midpoint: THREE.Vector3 | null;
+  centre: THREE.Vector3 | null;
+};
+
+function tapeScreenOf(state: ThreeState, world: THREE.Vector3, rect: DOMRect) {
+  const projected = world.clone().project(state.camera);
+  if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y) || projected.z < -1 || projected.z > 1) return null;
+  return { x: ((projected.x + 1) / 2) * rect.width, y: ((1 - projected.y) / 2) * rect.height };
+}
+
+/**
+ * The edges, corners, midpoints and centres of one body, in world space. They
+ * come from the body's own triangles (see tapeSnap), so every body offers
+ * them, not only the selected ones that have lines drawn; drawn CAD edges of
+ * an imported STEP body are added on top because they are exact. With a
+ * pointer, bodies far away from it on screen are passed over.
+ */
+function tapeSnapSources(state: ThreeState, target: THREE.Object3D, rect: DOMRect, pointer: { x: number; y: number } | null) {
+  const shapeId = target.userData.shapeId as string;
+  const topologyKey = target.userData.tapeTopologyKey as string | undefined;
+  const paths: TapeWorldPath[] = [];
+  const vertices: THREE.Vector3[] = [];
+  const cameraRight = new THREE.Vector3().setFromMatrixColumn(state.camera.matrixWorld, 0);
+  target.traverse((child) => {
+    if (!child.visible) return;
+    if (child instanceof THREE.Mesh) {
+      const geometry = child.geometry as THREE.BufferGeometry;
+      if (pointer) {
+        if (!geometry.boundingSphere) geometry.computeBoundingSphere();
+        const sphere = geometry.boundingSphere?.clone().applyMatrix4(child.matrixWorld);
+        if (sphere) {
+          const centre = tapeScreenOf(state, sphere.center, rect);
+          const rim = tapeScreenOf(state, sphere.center.clone().addScaledVector(cameraRight, sphere.radius), rect);
+          if (centre && rim) {
+            const reach = Math.hypot(rim.x - centre.x, rim.y - centre.y) + 24;
+            if (Math.hypot(pointer.x - centre.x, pointer.y - centre.y) > reach) return;
+          }
+        }
+      }
+      const analysis = analyzeSnapGeometry(geometry);
+      if (!analysis) return;
+      const toWorld = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z).applyMatrix4(child.matrixWorld);
+      for (let offset = 0; offset < analysis.vertices.length; offset += 3) {
+        vertices.push(toWorld(analysis.vertices[offset], analysis.vertices[offset + 1], analysis.vertices[offset + 2]));
+      }
+      analysis.paths.forEach((path, pathIndex) => {
+        const points: THREE.Vector3[] = [];
+        for (let offset = 0; offset < path.points.length; offset += 3) points.push(toWorld(path.points[offset], path.points[offset + 1], path.points[offset + 2]));
+        paths.push({
+          key: `${shapeId}:${child.uuid}:${pathIndex}`,
+          shapeId,
+          topologyKey,
+          points,
+          midpoint: path.midpoint ? toWorld(...path.midpoint) : null,
+          centre: path.centre ? toWorld(...path.centre) : null,
+        });
+      });
+      return;
+    }
+    if (!(child instanceof THREE.Line) || !child.userData.cadDisplayEdge) return;
+    const position = child.geometry.getAttribute("position");
+    if (!position || position.count < 2) return;
+    const points: THREE.Vector3[] = [];
+    for (let index = 0; index < position.count; index += 1) points.push(new THREE.Vector3().fromBufferAttribute(position, index).applyMatrix4(child.matrixWorld));
+    const closed = points[0].distanceToSquared(points[points.length - 1]) < 1e-10;
+    if (!closed) vertices.push(points[0].clone(), points[points.length - 1].clone());
+    const flat = points.flatMap((point) => [point.x, point.y, point.z]);
+    const centre = circleCentre(flat, closed);
+    paths.push({
+      key: `${shapeId}:${child.uuid}:cad`,
+      shapeId,
+      topologyKey,
+      points,
+      midpoint: closed ? null : tapePolylineMidpoint(points),
+      centre: centre ? new THREE.Vector3(...centre) : null,
+    });
+  });
+  return { paths, vertices };
+}
+
+/** Whether a point can be seen: nothing solid lies between it and the camera, and the section view has not cut it away. */
+function tapePointVisible(state: ThreeState, occluders: THREE.Object3D[], world: THREE.Vector3) {
+  if (state.sectionPlane && state.sectionPlane.distanceToPoint(world) < -0.001) return false;
+  const projected = world.clone().project(state.camera);
+  state.pointer.set(projected.x, projected.y);
+  state.raycaster.setFromCamera(state.pointer, state.camera);
+  state.raycaster.layers.set(RENDER_LAYER_SHAPES);
+  const reach = state.raycaster.ray.origin.distanceTo(world);
+  const tolerance = Math.max(0.05, reach * 0.002);
+  const blocker = state.raycaster.intersectObjects(occluders, true).find((entry) => {
+    if (!(entry.object instanceof THREE.Mesh)) return false;
+    if (state.sectionPlane && state.sectionPlane.distanceToPoint(entry.point) < -0.001) return false;
+    // Holes and see-through bodies show what is behind them, so they do not hide it.
+    const material = entry.object.material as THREE.Material | THREE.Material[];
+    const seeThrough = (Array.isArray(material) ? material : [material]).every((item) => item.transparent && item.opacity < 0.9);
+    return !seeThrough;
+  });
+  return !blocker || blocker.distance >= reach - tolerance;
+}
+
+function tapePolylinePointAt(points: THREE.Vector3[], distance: number) {
+  let travelled = 0;
+  for (let index = 0; index + 1 < points.length; index += 1) {
+    const piece = points[index].distanceTo(points[index + 1]);
+    if (travelled + piece >= distance && piece > 0) return points[index].clone().lerp(points[index + 1], (distance - travelled) / piece);
+    travelled += piece;
+  }
+  return points[points.length - 1].clone();
+}
+
+/**
+ * A point on a flat face, moved to the grid but kept in the face's plane:
+ * the grid position nearest the pointer, pushed back onto the plane along its
+ * normal. On a face square to the axes that is exactly a grid point of the
+ * face. Kept only if it still lies on the same face, so a point near the
+ * border never falls off; a curved face keeps the point as it was.
+ */
+function tapeGridPointOnFace(state: ThreeState, hit: THREE.Intersection, step: number, targets: THREE.Object3D[]) {
+  if (!(step > 0) || !(hit.object instanceof THREE.Mesh) || typeof hit.faceIndex !== "number" || !hit.face) return null;
+  const analysis = analyzeSnapGeometry(hit.object.geometry as THREE.BufferGeometry);
+  const region = analysis ? analysis.regionOf(hit.faceIndex) : -1;
+  if (!analysis || region < 0 || !analysis.regionIsPlanar(region)) return null;
+  const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize();
+  const rounded = new THREE.Vector3(
+    Math.round(hit.point.x / step) * step,
+    Math.round(hit.point.y / step) * step,
+    Math.round(hit.point.z / step) * step,
+  );
+  const snapped = rounded.addScaledVector(normal, -rounded.clone().sub(hit.point).dot(normal));
+  // Clean float noise on axes the face is square to, so 20 stays 20.
+  (["x", "y", "z"] as const).forEach((axis) => {
+    const nearest = Math.round(snapped[axis] / step) * step;
+    if (Math.abs(snapped[axis] - nearest) < 1e-6) snapped[axis] = nearest;
+  });
+  // Still on this face? Look at it from the camera and see what is hit first.
+  const projected = snapped.clone().project(state.camera);
+  state.pointer.set(projected.x, projected.y);
+  state.raycaster.setFromCamera(state.pointer, state.camera);
+  state.raycaster.layers.set(RENDER_LAYER_SHAPES);
+  const check = state.raycaster.intersectObjects(targets, true).find((entry) => entry.object instanceof THREE.Mesh);
+  if (!check || check.object !== hit.object || typeof check.faceIndex !== "number" || analysis.regionOf(check.faceIndex) !== region) return null;
+  if (check.point.distanceTo(snapped) > Math.max(0.01, step * 0.01)) return null;
+  return snapped;
+}
+
+function tapeEdgeAttachmentFor(state: ThreeState, path: TapeWorldPath): TapeEdgeAttachment | null {
+  const attachments = path.points.map((point) => tapeAttachmentFromWorld(state, path.shapeId, point, "edge"));
+  if (attachments.some((attachment) => !attachment)) return null;
+  return {
+    key: path.key,
+    shapeId: path.shapeId,
+    normalizedPoints: attachments.map((attachment) => (attachment as TapeAttachment).normalized),
+    topologyKey: path.topologyKey,
+  };
+}
+
+/**
+ * The point on a body the tape would take at this pointer position. In order:
+ * a corner, an edge's midpoint or a circle's centre near the pointer; else the
+ * nearest point on an edge; else the face under the pointer. Points and edges
+ * behind a body do not count, so the tape no longer jumps to the back side.
+ * `free` (Alt held) skips all of that and takes the surface as it is.
+ */
+function pickModelTapeCandidate(
+  state: ThreeState,
+  shapeIds: string[],
+  occluderIds: string[],
+  clientX: number,
+  clientY: number,
+  free = false,
+  step = 0,
+): TapeCandidate | null {
   const rect = state.renderer.domElement.getBoundingClientRect();
-  const pointerX = clientX - rect.left;
-  const pointerY = clientY - rect.top;
+  const pointer = { x: clientX - rect.left, y: clientY - rect.top };
   const targets = shapeIds.flatMap((id) => {
     const object = findShapeObject(state, id);
     return object ? [object] : [];
   });
   if (targets.length === 0) return null;
+  const occluders = occluderIds.flatMap((id) => {
+    const object = findShapeObject(state, id);
+    return object ? [object] : [];
+  });
 
   state.camera.updateMatrixWorld();
   targets.forEach((target) => target.updateWorldMatrix(true, true));
-  const vertexCandidates: Array<{ distance: number; candidate: TapeCandidate }> = [];
-  const edgeCandidates: Array<{ distance: number; candidate: TapeCandidate }> = [];
 
-  targets.forEach((target) => {
-    const shapeId = target.userData.shapeId as string;
-    target.traverse((child) => {
-      if (!(child instanceof THREE.Line) || !child.visible) return;
-      const position = child.geometry.getAttribute("position");
-      if (!position || position.count < 2) return;
-      const paths: THREE.Vector3[][] = [];
-      if ((child as THREE.LineSegments).isLineSegments) {
-        const segments: Array<[THREE.Vector3, THREE.Vector3]> = [];
-        for (let index = 0; index + 1 < position.count; index += 2) {
-          segments.push([
-            new THREE.Vector3().fromBufferAttribute(position, index).applyMatrix4(child.matrixWorld),
-            new THREE.Vector3().fromBufferAttribute(position, index + 1).applyMatrix4(child.matrixWorld),
-          ]);
-        }
-        paths.push(...chainTapeLineSegments(segments));
-      } else {
-        const path: THREE.Vector3[] = [];
-        for (let index = 0; index < position.count; index += 1) path.push(new THREE.Vector3().fromBufferAttribute(position, index).applyMatrix4(child.matrixWorld));
-        if ((child as THREE.LineLoop).isLineLoop && path.length > 2) path.push(path[0].clone());
-        paths.push(path);
-      }
-
-      paths.forEach((worldPoints, pathIndex) => {
-        if (worldPoints.length < 2) return;
-        const attachments = worldPoints.map((point) => tapeAttachmentFromWorld(state, shapeId, point, "edge"));
-        if (attachments.some((attachment) => !attachment)) return;
-        const normalizedPoints = attachments.map((attachment) => (attachment as TapeAttachment).normalized);
-        const edge: TapeEdgeAttachment = {
-          key: `${shapeId}:${child.uuid}:${pathIndex}`,
-          shapeId,
-          normalizedPoints,
-          topologyKey: target.userData.tapeTopologyKey as string | undefined,
-        };
-        const endpointIndexes = worldPoints[0].distanceToSquared(worldPoints[worldPoints.length - 1]) < 1e-10 ? [0] : [0, worldPoints.length - 1];
-        endpointIndexes.forEach((index) => {
-          const screen = projectToScreen(worldPoints[index], state);
-          const distance = Math.hypot(pointerX - screen.x, pointerY - screen.y);
-          if (distance <= 9) {
-            vertexCandidates.push({
-              distance,
-              candidate: {
-                x: worldPoints[index].x,
-                y: worldPoints[index].y,
-                z: worldPoints[index].z,
-                attachment: { ...(attachments[index] as TapeAttachment), kind: "vertex" },
-              },
-            });
+  if (!free) {
+    type Found = { distance: number; world: THREE.Vector3; kind: TapeSnapKind; shapeId: string; topologyKey?: string; path?: TapeWorldPath; along?: number };
+    const points: Found[] = [];
+    const edges: Found[] = [];
+    targets.forEach((target) => {
+      const { paths, vertices } = tapeSnapSources(state, target, rect, pointer);
+      const shapeId = target.userData.shapeId as string;
+      const topologyKey = target.userData.tapeTopologyKey as string | undefined;
+      const consider = (world: THREE.Vector3, kind: TapeSnapKind, radius: number, bias: number) => {
+        const screen = tapeScreenOf(state, world, rect);
+        if (!screen) return;
+        const distance = Math.hypot(pointer.x - screen.x, pointer.y - screen.y);
+        if (distance <= radius) points.push({ distance: distance - bias, world, kind, shapeId, topologyKey });
+      };
+      vertices.forEach((world) => consider(world, "vertex", TAPE_VERTEX_SNAP_PX, 2));
+      paths.forEach((path) => {
+        if (path.midpoint) consider(path.midpoint, "midpoint", TAPE_POINT_SNAP_PX, 0);
+        if (path.centre) consider(path.centre, "centre", TAPE_POINT_SNAP_PX, 1);
+        let best: Found | null = null;
+        let travelled = 0;
+        for (let index = 0; index + 1 < path.points.length; index += 1) {
+          const piece = path.points[index].distanceTo(path.points[index + 1]);
+          const a = tapeScreenOf(state, path.points[index], rect);
+          const b = tapeScreenOf(state, path.points[index + 1], rect);
+          if (a && b) {
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const amount = dx * dx + dy * dy > 0.001 ? clamp(((pointer.x - a.x) * dx + (pointer.y - a.y) * dy) / (dx * dx + dy * dy), 0, 1) : 0;
+            const distance = Math.hypot(pointer.x - (a.x + dx * amount), pointer.y - (a.y + dy * amount));
+            if (distance <= TAPE_EDGE_SNAP_PX && (!best || distance < best.distance)) {
+              best = { distance, world: path.points[index].clone().lerp(path.points[index + 1], amount), kind: "edge", shapeId: path.shapeId, topologyKey, path, along: travelled + piece * amount };
+            }
           }
-        });
-
-        for (let index = 0; index + 1 < worldPoints.length; index += 1) {
-          const aScreen = projectToScreen(worldPoints[index], state);
-          const bScreen = projectToScreen(worldPoints[index + 1], state);
-          const dx = bScreen.x - aScreen.x;
-          const dy = bScreen.y - aScreen.y;
-          const amount = dx * dx + dy * dy > 0.001 ? clamp(((pointerX - aScreen.x) * dx + (pointerY - aScreen.y) * dy) / (dx * dx + dy * dy), 0, 1) : 0;
-          const distance = Math.hypot(pointerX - (aScreen.x + dx * amount), pointerY - (aScreen.y + dy * amount));
-          if (distance <= 12) {
-            const world = worldPoints[index].clone().lerp(worldPoints[index + 1], amount);
-            const normalizedA = normalizedPoints[index];
-            const normalizedB = normalizedPoints[index + 1];
-            edgeCandidates.push({
-              distance,
-              candidate: {
-                x: world.x,
-                y: world.y,
-                z: world.z,
-                attachment: {
-                  shapeId,
-                  kind: "edge",
-                  topologyKey: target.userData.tapeTopologyKey as string | undefined,
-                  normalized: [
-                    normalizedA[0] + (normalizedB[0] - normalizedA[0]) * amount,
-                    normalizedA[1] + (normalizedB[1] - normalizedA[1]) * amount,
-                    normalizedA[2] + (normalizedB[2] - normalizedA[2]) * amount,
-                  ],
-                },
-                edge,
-              },
-            });
-          }
+          travelled += piece;
         }
+        if (best) edges.push(best);
       });
     });
-  });
 
-  vertexCandidates.sort((a, b) => a.distance - b.distance);
-  edgeCandidates.sort((a, b) => a.distance - b.distance);
-  if (vertexCandidates[0]) return vertexCandidates[0].candidate;
-  if (edgeCandidates[0]) return edgeCandidates[0].candidate;
+    const firstVisible = (list: Found[]) => list.sort((a, b) => a.distance - b.distance).slice(0, 8).find((found) => tapePointVisible(state, occluders, found.world));
+    const point = firstVisible(points);
+    if (point) {
+      // A corner keeps to the corner when the body changes; a midpoint or a
+      // centre is a place on the body, not a corner of it.
+      const attachment = tapeAttachmentFromWorld(state, point.shapeId, point.world, point.kind === "vertex" ? "vertex" : "surface");
+      if (attachment) return { x: point.world.x, y: point.world.y, z: point.world.z, attachment, snap: point.kind };
+    }
+    const edge = firstVisible(edges);
+    if (edge?.path) {
+      // The point stays where it was pointed at, held on the edge and moved
+      // to the nearest grid step along it, counted from the edge's start.
+      const length = tapePolylineLength(edge.path.points);
+      const along = step > 0 && typeof edge.along === "number" ? clamp(Math.round(edge.along / step) * step, 0, length) : edge.along ?? 0;
+      const world = step > 0 ? tapePolylinePointAt(edge.path.points, along) : edge.world;
+      const attachment = tapeAttachmentFromWorld(state, edge.shapeId, world, "edge");
+      const edgeAttachment = tapeEdgeAttachmentFor(state, edge.path);
+      if (attachment) {
+        return {
+          x: world.x,
+          y: world.y,
+          z: world.z,
+          attachment,
+          edge: edgeAttachment ?? undefined,
+          snap: "edge",
+          alongEdge: Math.min(along, length - along),
+        };
+      }
+    }
+  }
 
-  state.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-  state.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  state.pointer.x = (pointer.x / rect.width) * 2 - 1;
+  state.pointer.y = -(pointer.y / rect.height) * 2 + 1;
   state.raycaster.setFromCamera(state.pointer, state.camera);
   state.raycaster.layers.set(RENDER_LAYER_SHAPES);
-  const surfaceHit = state.raycaster.intersectObjects(targets, true).find((entry) => entry.object instanceof THREE.Mesh);
+  const surfaceHit = state.raycaster.intersectObjects(targets, true).find((entry) => (
+    entry.object instanceof THREE.Mesh
+    && !(state.sectionPlane && state.sectionPlane.distanceToPoint(entry.point) < -0.001)
+  ));
   if (!surfaceHit) return null;
   const shapeId = surfaceHit.object.userData.shapeId as string;
-  const attachment = tapeAttachmentFromWorld(state, shapeId, surfaceHit.point);
-  return attachment ? { x: surfaceHit.point.x, y: surfaceHit.point.y, z: surfaceHit.point.z, attachment } : null;
+  const point = free ? surfaceHit.point.clone() : tapeGridPointOnFace(state, surfaceHit, step, targets) ?? surfaceHit.point.clone();
+  const attachment = tapeAttachmentFromWorld(state, shapeId, point);
+  if (!attachment) return null;
+  return {
+    x: point.x,
+    y: point.y,
+    z: point.z,
+    attachment,
+    snap: "face",
+    face: typeof surfaceHit.faceIndex === "number" ? { meshId: surfaceHit.object.uuid, triangle: surfaceHit.faceIndex } : undefined,
+  };
+}
+
+/**
+ * Lights up the face the tape point would land on: the triangles of that body
+ * reached from the one under the pointer without crossing an edge. Nothing is
+ * drawn for a body too dense to analyse, or when there is no face.
+ */
+function syncTapeFaceHighlight(state: ThreeState | null, face: TapeCandidate["face"] | null, theme: ResolvedAppTheme) {
+  if (!state) return;
+  let layer = state.tapeFaceLayer;
+  if (!layer) {
+    layer = new THREE.Group();
+    layer.name = "TapeFaceHighlight";
+    layer.layers.set(RENDER_LAYER_PREVIEWS);
+    layer.visible = false;
+    state.tapeFaceLayer = layer;
+    state.scene.add(layer);
+  }
+  const clear = () => {
+    if (layer.userData.key === undefined) return;
+    disposeChildren(layer);
+    layer.userData.key = undefined;
+    layer.visible = false;
+    state.needsRender = true;
+  };
+  const mesh = face ? state.shapeLayer.getObjectByProperty("uuid", face.meshId) : undefined;
+  if (!face || !(mesh instanceof THREE.Mesh)) {
+    clear();
+    return;
+  }
+  const analysis = analyzeSnapGeometry(mesh.geometry as THREE.BufferGeometry);
+  const region = analysis ? analysis.regionOf(face.triangle) : -1;
+  if (!analysis || region < 0) {
+    clear();
+    return;
+  }
+  mesh.updateWorldMatrix(true, false);
+  const key = `${mesh.uuid}:${region}:${theme}:${mesh.matrixWorld.elements.join(",")}`;
+  if (layer.userData.key === key) return;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(analysis.regionPositions(region), 3));
+  const highlight = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({
+      color: theme === "dark" ? "#69d9ff" : "#079bc6",
+      transparent: true,
+      opacity: 0.32,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
+    }),
+  );
+  highlight.matrixAutoUpdate = false;
+  highlight.matrix.copy(mesh.matrixWorld);
+  highlight.layers.set(RENDER_LAYER_PREVIEWS);
+  highlight.renderOrder = 960;
+  highlight.raycast = () => undefined;
+  disposeChildren(layer);
+  layer.add(highlight);
+  layer.userData.key = key;
+  layer.visible = true;
+  state.needsRender = true;
 }
 
 function distanceToScreenSegment(x: number, y: number, ax: number, ay: number, bx: number, by: number) {
@@ -1828,7 +2091,12 @@ function syncTapeOverlay(
     hover: hoverScreen ? {
       screenX: hoverScreen.x,
       screenY: hoverScreen.y,
+      // The edge the point slides along is drawn thin; with Shift, when the
+      // click would measure the whole edge, it is drawn in full strength.
       edgeScreenPoints: hoverEdgePoints.length >= 2 ? tapeScreenPointList(hoverEdgePoints, state) : undefined,
+      wholeEdge: Boolean(model.hover?.wholeEdge),
+      kind: model.hover?.snap,
+      detail: model.hover?.snap === "edge" && typeof model.hover.alongEdge === "number" ? formatMeasure(model.hover.alongEdge, accuracy) : undefined,
     } : null,
   };
   const previous = overlayRef.current;
@@ -1854,6 +2122,9 @@ function syncTapeOverlay(
     }) &&
     ((!previous.hover && !next.hover) ||
       (previous.hover && next.hover
+        && previous.hover.kind === next.hover.kind
+        && previous.hover.wholeEdge === next.hover.wholeEdge
+        && previous.hover.detail === next.hover.detail
         && previous.hover.edgeScreenPoints === next.hover.edgeScreenPoints
         && Math.abs(previous.hover.screenX - next.hover.screenX) < 0.2
         && Math.abs(previous.hover.screenY - next.hover.screenY) < 0.2));
@@ -2272,6 +2543,50 @@ function SectionMeasureOverlay({ overlay }: { overlay: SectionMeasureOverlayStat
   );
 }
 
+const TAPE_SNAP_LABELS: Record<TapeSnapKind, MessageKey> = {
+  vertex: "tape.snap.vertex",
+  midpoint: "tape.snap.midpoint",
+  centre: "tape.snap.centre",
+  edge: "tape.snap.edge",
+  wholeEdge: "tape.snap.wholeEdge",
+  note: "tape.snap.note",
+  face: "tape.snap.face",
+  grid: "tape.snap.grid",
+  point: "tape.snap.point",
+  tapeLine: "tape.snap.tapeLine",
+};
+
+/**
+ * The mark under the pointer while placing a tape point, shaped by what it
+ * holds on to - the way CAD programs show their snaps: a square on a corner,
+ * a triangle on a midpoint, a crossed circle on a centre, a dot on an edge or
+ * a face, a cross on the grid.
+ */
+function TapeSnapMarker({ x, y, kind }: { x: number; y: number; kind?: TapeSnapKind }) {
+  const className = `tape-hover-point ${kind ?? ""}`;
+  if (kind === "vertex") return <rect className={className} x={x - 6} y={y - 6} width="12" height="12" />;
+  if (kind === "note") return <polygon className={className} points={`${x},${y - 8} ${x + 8},${y} ${x},${y + 8} ${x - 8},${y}`} />;
+  if (kind === "midpoint") return <polygon className={className} points={`${x},${y - 7} ${x + 7},${y + 5} ${x - 7},${y + 5}`} />;
+  if (kind === "centre") {
+    return (
+      <g className={className}>
+        <circle cx={x} cy={y} r="7" />
+        <line x1={x - 10} y1={y} x2={x + 10} y2={y} />
+        <line x1={x} y1={y - 10} x2={x} y2={y + 10} />
+      </g>
+    );
+  }
+  if (kind === "grid") {
+    return (
+      <g className={className}>
+        <line x1={x - 6} y1={y} x2={x + 6} y2={y} />
+        <line x1={x} y1={y - 6} x2={x} y2={y + 6} />
+      </g>
+    );
+  }
+  return <circle className={className} cx={x} cy={y} r={kind === "face" ? 4 : 5} />;
+}
+
 function TapeOverlay({
   overlay,
   startPointId,
@@ -2331,9 +2646,16 @@ function TapeOverlay({
             onPointerCancel={(event) => onPointPointerUp(event, point.id)}
           />
         ))}
-        {active && overlay.hover?.edgeScreenPoints ? <polyline className="tape-hover-edge" points={overlay.hover.edgeScreenPoints} fill="none" /> : null}
-        {active && overlay.hover ? <circle className="tape-hover-point" cx={overlay.hover.screenX} cy={overlay.hover.screenY} r="5" /> : null}
+        {active && overlay.hover?.edgeScreenPoints ? <polyline className={`tape-hover-edge ${overlay.hover.wholeEdge ? "whole" : ""}`} points={overlay.hover.edgeScreenPoints} fill="none" /> : null}
+        {active && overlay.hover ? <TapeSnapMarker x={overlay.hover.screenX} y={overlay.hover.screenY} kind={overlay.hover.kind} /> : null}
       </svg>
+      {active && overlay.hover?.kind ? (
+        <span className={`tape-snap-label ${overlay.hover.kind}`} style={{ left: overlay.hover.screenX + 12, top: overlay.hover.screenY + 10 }}>
+          {overlay.hover.detail
+            ? t("tape.snap.edgeFromEnd", { distance: overlay.hover.detail })
+            : t(TAPE_SNAP_LABELS[overlay.hover.kind])}
+        </span>
+      ) : null}
       {overlay.segments.map((segment) => (
         <span key={`${segment.id}-label`} className="tape-label" style={{ left: segment.labelX, top: segment.labelY }}>
           {segment.label}
@@ -4960,6 +5282,11 @@ export function WorkplaneViewport({
     }
   }, [tapeModel]);
 
+  const tapeHoverFace = (tapeMode || tapeMoveMode) && tapeModel.hover?.snap === "face" ? tapeModel.hover.face ?? null : null;
+  useEffect(() => {
+    syncTapeFaceHighlight(threeRef.current, tapeHoverFace, resolvedTheme);
+  }, [resolvedTheme, tapeHoverFace?.meshId, tapeHoverFace?.triangle]); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     overhangUniforms.uOverhangOn.value = showOverhangs ? 1 : 0;
     overhangUniforms.uOverhangLimit.value = overhangDownwardLimit(workspace.overhangAngle);
@@ -5431,6 +5758,9 @@ export function WorkplaneViewport({
       if (state.bentTubeSegmentLayer) {
         disposeChildren(state.bentTubeSegmentLayer);
       }
+      if (state.tapeFaceLayer) {
+        disposeChildren(state.tapeFaceLayer);
+      }
       disposeChildren(state.shapeLayer);
       state.shapeRecords.clear();
       disposeChildren(state.helperLayer);
@@ -5746,7 +6076,8 @@ export function WorkplaneViewport({
   }, [storeTapeModel]);
 
   const resolveTapeCandidate = useCallback(
-    (clientX: number, clientY: number, ignoredPointId?: string): TapeCandidate | null => {
+    (clientX: number, clientY: number, ignoredPointId?: string, modifiers: { altKey?: boolean; shiftKey?: boolean } = {}): TapeCandidate | null => {
+      const free = Boolean(modifiers.altKey);
       const state = threeRef.current;
       if (!state) return null;
 
@@ -5754,7 +6085,7 @@ export function WorkplaneViewport({
       const rect = state.renderer.domElement.getBoundingClientRect();
       const localX = clientX - rect.left;
       const localY = clientY - rect.top;
-      const closestPoint = model.points.reduce<{ point: TapePoint; distance: number } | null>((closest, point) => {
+      const closestPoint = free ? null : model.points.reduce<{ point: TapePoint; distance: number } | null>((closest, point) => {
         if (point.id === ignoredPointId) return closest;
         const screen = projectToScreen(tapePointWorld(state, point), state);
         const distance = Math.hypot(screen.x - localX, screen.y - localY);
@@ -5765,10 +6096,10 @@ export function WorkplaneViewport({
       }, null);
       if (closestPoint) {
         const world = tapePointWorld(state, closestPoint.point);
-        return { x: world.x, y: world.y, z: world.z, pointId: closestPoint.point.id, attachment: closestPoint.point.attachment };
+        return { x: world.x, y: world.y, z: world.z, pointId: closestPoint.point.id, attachment: closestPoint.point.attachment, snap: "point" };
       }
 
-      const closestSegment = model.segments.reduce<{ world: THREE.Vector3; distance: number } | null>((closest, segment) => {
+      const closestSegment = free ? null : model.segments.reduce<{ world: THREE.Vector3; distance: number } | null>((closest, segment) => {
         if (segment.startId === ignoredPointId || segment.endId === ignoredPointId) return closest;
         const start = model.points.find((point) => point.id === segment.startId);
         const end = model.points.find((point) => point.id === segment.endId);
@@ -5791,12 +6122,34 @@ export function WorkplaneViewport({
 
       if (closestSegment) {
         const existing = model.points.find((point) => tapePointWorld(state, point).distanceTo(closestSegment.world) < 0.001);
-        return { x: closestSegment.world.x, y: closestSegment.world.y, z: closestSegment.world.z, pointId: existing?.id };
+        return { x: closestSegment.world.x, y: closestSegment.world.y, z: closestSegment.world.z, pointId: existing?.id, snap: existing ? "point" : "tapeLine" };
+      }
+
+      // A note marks a place on purpose, so it is the most exact thing to
+      // measure to. A note pinned to a body keeps the tape point on that body.
+      if (!free && notesVisibleRef.current) {
+        const closestNote = notesRef.current.reduce<{ note: WorkplaneNote; world: THREE.Vector3; distance: number } | null>((closest, note) => {
+          const world = noteWorldPosition(state, note);
+          const screen = projectToScreen(world, state);
+          const distance = Math.hypot(screen.x - localX, screen.y - localY);
+          return distance <= 13 && (!closest || distance < closest.distance) ? { note, world, distance } : closest;
+        }, null);
+        if (closestNote) {
+          const { note, world } = closestNote;
+          const attachment: TapeAttachment | undefined = note.anchor
+            ? { shapeId: note.anchor.shapeId, normalized: [...note.anchor.normalized] as [number, number, number], kind: "surface", topologyKey: findShapeObject(state, note.anchor.shapeId)?.userData.tapeTopologyKey as string | undefined }
+            : undefined;
+          return { x: world.x, y: world.y, z: world.z, attachment, snap: "note" };
+        }
       }
 
       const selectedShapeIds = selectedIdsRef.current.filter((id) => shapesRef.current.some((shape) => shape.id === id && !shape.hidden));
-      const targetShapeIds = selectedShapeIds.length > 0 ? selectedShapeIds : shapesRef.current.filter((shape) => !shape.hidden).map((shape) => shape.id);
-      const modelCandidate = pickModelTapeCandidate(state, targetShapeIds, clientX, clientY);
+      const visibleShapeIds = shapesRef.current.filter((shape) => !shape.hidden).map((shape) => shape.id);
+      const targetShapeIds = selectedShapeIds.length > 0 ? selectedShapeIds : visibleShapeIds;
+      const modelCandidate = pickModelTapeCandidate(state, targetShapeIds, visibleShapeIds, clientX, clientY, free, snapStep(snapRef.current));
+      if (modelCandidate?.snap === "edge" && modifiers.shiftKey && !ignoredPointId && !tapeModelRef.current.startPointId) {
+        return { ...modelCandidate, wholeEdge: true, snap: "wholeEdge" };
+      }
       if (modelCandidate) return modelCandidate;
 
       const raw = toRawPlanePoint(clientX, clientY, state.dragPlane);
@@ -5809,7 +6162,7 @@ export function WorkplaneViewport({
         z: clamp(snapValue(raw.z, step), -bounds.depth / 2, bounds.depth / 2),
       };
       const existing = model.points.find((point) => Math.hypot(point.x - snapped.x, point.y, point.z - snapped.z) < 0.001 && !point.attachment);
-      return { ...snapped, pointId: existing?.id };
+      return { ...snapped, pointId: existing?.id, snap: existing ? "point" : "grid" };
     },
     [toRawPlanePoint],
   );
@@ -5837,7 +6190,7 @@ export function WorkplaneViewport({
         attachment: value.attachment,
       };
 
-      if (candidate.edge && !current.startPointId) {
+      if (candidate.edge && candidate.wholeEdge && !current.startPointId) {
         const state = threeRef.current;
         const worldPoints = state ? tapeEdgeWorldPoints(state, candidate.edge) : [];
         if (worldPoints.length >= 2) {
@@ -5895,16 +6248,24 @@ export function WorkplaneViewport({
     [storeTapeModel],
   );
 
+  /** Where the pointer last was over the view while measuring, so Shift and Alt can act without a move. */
+  const tapeLastPointerRef = useRef<{ x: number; y: number } | null>(null);
+
   const updateTapeHover = useCallback(
-    (clientX: number, clientY: number) => {
+    (clientX: number, clientY: number, modifiers: { altKey?: boolean; shiftKey?: boolean } = {}) => {
       if (!tapeModeRef.current) {
         return;
       }
-      const candidate = resolveTapeCandidate(clientX, clientY);
+      tapeLastPointerRef.current = { x: clientX, y: clientY };
+      const candidate = resolveTapeCandidate(clientX, clientY, undefined, modifiers);
       const current = tapeModelRef.current;
       const hover = candidate;
       if ((!current.hover && !hover) || (current.hover && hover
         && current.hover.edge?.key === hover.edge?.key
+        && current.hover.snap === hover.snap
+        && current.hover.wholeEdge === hover.wholeEdge
+        && current.hover.face?.meshId === hover.face?.meshId
+        && current.hover.face?.triangle === hover.face?.triangle
         && Math.hypot(current.hover.x - hover.x, current.hover.y - hover.y, current.hover.z - hover.z) < 0.0001)) {
         return;
       }
@@ -5912,6 +6273,31 @@ export function WorkplaneViewport({
     },
     [resolveTapeCandidate, storeTapeModel],
   );
+
+  // Shift (whole edge) and Alt (no snapping) change what a click would do, so
+  // the mark under the pointer follows them at once, not only on the next move.
+  useEffect(() => {
+    if (!tapeMode) return;
+    const refresh = (event: KeyboardEvent) => {
+      if (event.key !== "Shift" && event.key !== "Alt") return;
+      const last = tapeLastPointerRef.current;
+      if (!last || !tapeModeRef.current) return;
+      updateTapeHover(last.x, last.y, { shiftKey: event.shiftKey, altKey: event.altKey });
+    };
+    // Letting go of a key in another window would otherwise leave the mark as it was.
+    const reset = () => {
+      const last = tapeLastPointerRef.current;
+      if (last && tapeModeRef.current) updateTapeHover(last.x, last.y, {});
+    };
+    window.addEventListener("keydown", refresh);
+    window.addEventListener("keyup", refresh);
+    window.addEventListener("blur", reset);
+    return () => {
+      window.removeEventListener("keydown", refresh);
+      window.removeEventListener("keyup", refresh);
+      window.removeEventListener("blur", reset);
+    };
+  }, [tapeMode, updateTapeHover]);
 
   const removeTapeSegment = useCallback(
     (segmentId: string) => {
@@ -7069,7 +7455,8 @@ export function WorkplaneViewport({
       // Die Ecken der Koerperboxen - die Kantenlinien, an denen das Massband
       // einrastet, sind nicht in jeder Ansicht da. Dazu deren echte Eckpunkte.
       const corners = visible.flatMap((shape) => shapeBoxCornersWorld(shape));
-      const modelVertex = visible.length ? pickModelTapeCandidate(state, visible.map((shape) => shape.id), clientX, clientY) : null;
+      const visibleIds = visible.map((shape) => shape.id);
+      const modelVertex = visible.length ? pickModelTapeCandidate(state, visibleIds, visibleIds, clientX, clientY) : null;
       if (modelVertex?.attachment?.kind === "vertex") corners.push(new THREE.Vector3(modelVertex.x, modelVertex.y, modelVertex.z));
       if (notesVisibleRef.current) referencePoints(notesRef.current).forEach((point) => corners.push(new THREE.Vector3(point.x, point.y, point.z)));
       let nearest: { point: THREE.Vector3; distance: number } | null = null;
@@ -7364,7 +7751,7 @@ export function WorkplaneViewport({
 
       if (tapeModeRef.current) {
         event.preventDefault();
-        const candidate = resolveTapeCandidate(event.clientX, event.clientY);
+        const candidate = resolveTapeCandidate(event.clientX, event.clientY, undefined, event);
         if (candidate) {
           selectTapeCandidate(candidate);
         }
@@ -7813,7 +8200,7 @@ export function WorkplaneViewport({
         return;
       }
       if (tapeModeRef.current) {
-        updateTapeHover(event.clientX, event.clientY);
+        updateTapeHover(event.clientX, event.clientY, event);
         return;
       }
       if (tapeMoveModeRef.current) return;
@@ -8011,6 +8398,7 @@ export function WorkplaneViewport({
   }, [clearMoveDimensions, onInteractionActiveChange, setMarqueeFromState]);
 
   const handlePointerLeave = useCallback(() => {
+    tapeLastPointerRef.current = null;
     if (workplaneModeRef.current) {
       syncWorkplaneHoverPreview(threeRef.current, null, workspaceRef.current, resolvedThemeRef.current);
     }
@@ -8632,7 +9020,7 @@ export function WorkplaneViewport({
       if (!tapeMoveModeRef.current || !drag || drag.pointId !== pointId || drag.pointerId !== event.pointerId) return;
       event.preventDefault();
       event.stopPropagation();
-      const candidate = resolveTapeCandidate(event.clientX, event.clientY, pointId);
+      const candidate = resolveTapeCandidate(event.clientX, event.clientY, pointId, event);
       if (!candidate) return;
       const current = tapeModelRef.current;
       storeTapeModel({
@@ -8681,7 +9069,7 @@ export function WorkplaneViewport({
       }
       event.preventDefault();
       event.stopPropagation();
-      const candidate = resolveTapeCandidate(event.clientX, event.clientY);
+      const candidate = resolveTapeCandidate(event.clientX, event.clientY, undefined, event);
       if (candidate) {
         selectTapeCandidate(candidate);
       }

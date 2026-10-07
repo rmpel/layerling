@@ -17,6 +17,10 @@ The tape measure sits at the lower end of the camera bar on the left edge ({{ui:
 
 [[Esc]] leaves measuring mode.
 
+### Snapping to corners, edges and faces
+
+While you add or move a point, the tape holds on to the body under the pointer and says what it found next to the pointer: {{ui:tape.snap.vertex}} for a corner, {{ui:tape.snap.midpoint}} for the middle of an edge, {{ui:tape.snap.centre}} for the centre of a round edge such as a hole or the rim of a cylinder, {{ui:tape.snap.note}} for a note or reference point, {{ui:tape.snap.edge}} when it lands on an edge, and {{ui:tape.snap.face}} when it lands on a surface, which is then lit up. On an edge or a face the point stays where you point; it is held exactly on that edge or in that face and moves in steps of the snap grid (bottom right): along an edge counted from its end, with the distance to the nearer end in the label, and on a flat face on the grid within that face. With the snap grid off it moves freely along the edge or face. Corners and edges at the back of a body are left out, so the point never jumps behind what you see. Hold [[Shift]] while clicking an edge to measure the whole edge at once. Hold [[Alt]] to place a point freely, without snapping. With bodies selected, the tape only snaps to those.
+
 ## The ruler
 
 You fetch the {{ui:shape.ruler}} from the shape library. It is purely a measuring tool: it appears in no export and can neither be grouped nor cut. For every body that touches or overlaps the ruler, it shows the extent as a floating number right in the view. You can change that number right there, and the body follows. The floating plus symbol creates a copy of the measured shape.
