@@ -2967,12 +2967,16 @@ export function LayerlingEditor({
   useEffect(() => {
     const applyTitles = () => {
       document.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
-        if (button.title) {
+        // Ein eigener Titel bleibt; einer, den wir hier selbst gesetzt haben,
+        // folgt dem aria-label - sonst bliebe er nach dem Sprachwechsel in
+        // der Sprache des ersten Renderns stehen.
+        if (button.title && button.title !== button.dataset.autoTitle) {
           return;
         }
-        const label = button.getAttribute("aria-label") ?? button.textContent?.trim();
-        if (label) {
-          button.title = label.replace(/\s+/g, " ");
+        const label = (button.getAttribute("aria-label") ?? button.textContent?.trim())?.replace(/\s+/g, " ");
+        if (label && button.title !== label) {
+          button.title = label;
+          button.dataset.autoTitle = label;
         }
       });
     };
